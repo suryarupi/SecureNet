@@ -23,3 +23,9 @@ models/*.joblib
 
 # Logs
 *.log
+
+#dataset raw
+data/
+
+# macOS
+.DS_Store
