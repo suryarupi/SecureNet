@@ -1,29 +1,16 @@
-"""
-SecureNet Decision Engine
+import pandas as pd
 
-Combines:
-    1. Isolation Forest
-    2. Binary XGBoost
-    3. Multiclass XGBoost
-
-The Decision Engine converts raw ML predictions into
-a final security decision.
-"""
-
-from predict import predict_flow
+from .predict import predict_flow
+from .explain import explain_binary, explain_multiclass
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-# Binary XGBoost attack probability thresholds
-HIGH_ATTACK_PROBABILITY = 0.90
-MEDIUM_ATTACK_PROBABILITY = 0.50
+DATA_PATH = "./data/raw/cicids2017_cleaned.csv"
 
-# Multiclass confidence thresholds
-HIGH_TYPE_CONFIDENCE = 0.80
-MEDIUM_TYPE_CONFIDENCE = 0.50
+TOP_FEATURES = 5
 
 
 # ============================================================
@@ -32,167 +19,134 @@ MEDIUM_TYPE_CONFIDENCE = 0.50
 
 def make_decision(prediction):
     """
-    Convert raw ML predictions into a final security decision.
-
-    Parameters
-    ----------
-    prediction : dict
-        Output returned by predict_flow()
-
-    Returns
-    -------
-    dict
-        Final security decision.
+    Convert raw ML predictions into a security decision.
     """
 
-    # --------------------------------------------------------
-    # Extract model results
-    # --------------------------------------------------------
-
-    binary_prediction = prediction["binary_prediction"]
     attack_probability = prediction["attack_probability"]
-
-    attack_type = prediction["attack_type"]
     attack_confidence = prediction["attack_confidence"]
-
     anomaly = prediction["anomaly"]
-    anomaly_score = prediction["anomaly_score"]
 
-    # ========================================================
-    # CASE 1: Binary XGBoost detected an attack
-    # ========================================================
+    # --------------------------------------------------------
+    # NORMAL
+    # --------------------------------------------------------
 
-    if binary_prediction == "Attack":
+    if prediction["binary_prediction"] == "Normal" and anomaly:
 
-        # ----------------------------------------------------
-        # Determine attack severity
-        # ----------------------------------------------------
+        return {
+        "status": "SUSPICIOUS",
+        "severity": "LOW",
+        "attack_type": None,
+        "reason": (
+            "XGBoost classified the traffic as normal, "
+            "but Isolation Forest detected anomalous "
+            "network behaviour."
+        )
+    }
 
-        if attack_probability >= HIGH_ATTACK_PROBABILITY:
+    if prediction["binary_prediction"] == "Normal":
 
-            # Strong attack probability
-            if (
-                attack_confidence is not None
-                and attack_confidence >= HIGH_TYPE_CONFIDENCE
-            ):
-                severity = "HIGH"
+        return {
+        "status": "NORMAL",
+        "severity": "NONE",
+        "attack_type": None,
+        "reason": (
+            "No significant attack probability or "
+            "anomaly was detected."
+        )
+    }
 
-            elif (
-                attack_confidence is not None
-                and attack_confidence >= MEDIUM_TYPE_CONFIDENCE
-            ):
-                severity = "HIGH"
+    # --------------------------------------------------------
+    # HIGH SEVERITY
+    # --------------------------------------------------------
 
-            else:
-                # Binary model is highly confident,
-                # but attack type is uncertain.
-                severity = "MEDIUM"
+    if (
+        attack_probability >= 0.90
+        and
+        attack_confidence is not None
+        and
+        attack_confidence >= 0.80
+    ):
 
-        elif attack_probability >= MEDIUM_ATTACK_PROBABILITY:
+        return {
+            "status": "ATTACK",
+            "severity": "HIGH",
+            "attack_type": prediction["attack_type"],
+            "reason": (
+                "High-confidence attack detected by "
+                "Binary XGBoost and attack type identified "
+                "with high confidence by Multiclass XGBoost."
+            )
+        }
 
-            severity = "MEDIUM"
+    # --------------------------------------------------------
+    # MEDIUM SEVERITY
+    # --------------------------------------------------------
 
-        else:
+    if attack_probability >= 0.50:
 
-            severity = "LOW"
+        if (
+            attack_confidence is not None
+            and
+            attack_confidence >= 0.50
+        ):
 
-        # ----------------------------------------------------
-        # Determine explanation
-        # ----------------------------------------------------
-
-        if attack_confidence is not None:
-
-            if attack_confidence >= HIGH_TYPE_CONFIDENCE:
-
-                reason = (
-                    "High-confidence attack detected by "
-                    "Binary XGBoost and attack type identified "
-                    "with high confidence by Multiclass XGBoost."
-                )
-
-            elif attack_confidence >= MEDIUM_TYPE_CONFIDENCE:
-
-                reason = (
-                    "XGBoost detected an attack and identified "
-                    "the attack type with moderate confidence."
-                )
-
-            else:
-
-                reason = (
-                    "XGBoost strongly detected an attack, "
-                    "but the exact attack type has low confidence."
-                )
+            reason = (
+                "XGBoost detected an attack and identified "
+                "the attack type with moderate confidence."
+            )
 
         else:
 
             reason = (
-                "Binary XGBoost detected attack traffic."
+                "XGBoost strongly detected an attack, "
+                "but the exact attack type has low confidence."
             )
-
-        # ----------------------------------------------------
-        # Return attack decision
-        # ----------------------------------------------------
 
         return {
             "status": "ATTACK",
-            "severity": severity,
-            "attack_type": attack_type,
-            "attack_probability": attack_probability,
-            "attack_confidence": attack_confidence,
-            "anomaly": anomaly,
-            "anomaly_score": anomaly_score,
+            "severity": "MEDIUM",
+            "attack_type": prediction["attack_type"],
             "reason": reason
         }
 
-    # ========================================================
-    # CASE 2: Binary XGBoost says normal,
-    #         but Isolation Forest detects anomaly
-    # ========================================================
+    # --------------------------------------------------------
+    # LOW SEVERITY / ANOMALY
+    # --------------------------------------------------------
 
     if anomaly:
 
         return {
             "status": "SUSPICIOUS",
-            "severity": "MEDIUM",
-            "attack_type": None,
-            "attack_probability": attack_probability,
-            "attack_confidence": attack_confidence,
-            "anomaly": anomaly,
-            "anomaly_score": anomaly_score,
+            "severity": "LOW",
+            "attack_type": prediction["attack_type"],
             "reason": (
-                "Isolation Forest detected traffic that "
-                "significantly differs from learned normal "
-                "network behavior."
+                "Isolation Forest detected anomalous "
+                "network behaviour."
             )
         }
 
-    # ========================================================
-    # CASE 3: Normal traffic
-    # ========================================================
+    # --------------------------------------------------------
+    # FALLBACK
+    # --------------------------------------------------------
 
     return {
-        "status": "NORMAL",
-        "severity": "NONE",
-        "attack_type": None,
-        "attack_probability": attack_probability,
-        "attack_confidence": attack_confidence,
-        "anomaly": anomaly,
-        "anomaly_score": anomaly_score,
+        "status": "SUSPICIOUS",
+        "severity": "LOW",
+        "attack_type": prediction["attack_type"],
         "reason": (
-            "No significant attack probability or anomaly "
-            "was detected."
+            "Traffic shows some indication of malicious "
+            "behaviour but confidence is below the attack threshold."
         )
     }
 
 
 # ============================================================
-# Human-readable output
+# Print Decision
 # ============================================================
 
-def print_decision(decision):
+def print_decision(prediction, decision):
     """
-    Print a security decision in a readable format.
+    Print the final SecureNet decision.
     """
 
     print("\n========================================")
@@ -216,22 +170,22 @@ def print_decision(decision):
 
     print(
         f"Attack Probability : "
-        f"{decision['attack_probability']:.6f}"
+        f"{prediction['attack_probability']:.6f}"
     )
 
     print(
         f"Attack Confidence  : "
-        f"{decision['attack_confidence']}"
+        f"{prediction['attack_confidence']}"
     )
 
     print(
         f"Anomaly            : "
-        f"{decision['anomaly']}"
+        f"{prediction['anomaly']}"
     )
 
     print(
         f"Anomaly Score      : "
-        f"{decision['anomaly_score']:.6f}"
+        f"{prediction['anomaly_score']:.6f}"
     )
 
     print(
@@ -243,29 +197,114 @@ def print_decision(decision):
 
 
 # ============================================================
-# Test Decision Engine
+# SHAP Explanation
+# ============================================================
+
+def print_shap_explanation(flow, prediction):
+    """
+    Generate and print SHAP explanations for an attack.
+    """
+
+    # Only explain attacks
+    if prediction["binary_prediction"] != "Attack":
+        return
+
+    print("\n----------------------------------------")
+    print("       SHAP EXPLAINABILITY")
+    print("----------------------------------------")
+
+    # --------------------------------------------------------
+    # Binary XGBoost explanation
+    # --------------------------------------------------------
+
+    binary_explanation = explain_binary(flow)
+
+    print("\nWhy was this classified as an ATTACK?")
+
+    for _, row in binary_explanation.head(
+        TOP_FEATURES
+    ).iterrows():
+
+        direction = (
+            "toward ATTACK"
+            if row["SHAP Value"] > 0
+            else "toward NORMAL"
+        )
+
+        print(
+            f"{row['Feature']:<30} "
+            f"{row['SHAP Value']:>10.4f} "
+            f"({direction})"
+        )
+
+    # --------------------------------------------------------
+    # Multiclass explanation
+    # --------------------------------------------------------
+
+    if prediction["attack_type"] is not None:
+
+        try:
+
+            predicted_type, multiclass_explanation = (
+                explain_multiclass(flow)
+            )
+
+            print(
+                f"\nWhy was it classified as "
+                f"{predicted_type}?"
+            )
+
+            for _, row in multiclass_explanation.head(
+                TOP_FEATURES
+            ).iterrows():
+
+                direction = (
+                    "supports class"
+                    if row["SHAP Value"] > 0
+                    else "opposes class"
+                )
+
+                print(
+                    f"{row['Feature']:<30} "
+                    f"{row['SHAP Value']:>10.4f} "
+                    f"({direction})"
+                )
+
+        except Exception as error:
+
+            print(
+                "\nMulticlass SHAP explanation "
+                f"could not be generated: {error}"
+            )
+
+    print("----------------------------------------")
+
+
+# ============================================================
+# Main Test Pipeline
 # ============================================================
 
 if __name__ == "__main__":
-
-    import pandas as pd
-
-    DATA_PATH = "./data/raw/cicids2017_cleaned.csv"
 
     print("Loading test data...")
 
     df = pd.read_csv(DATA_PATH)
 
     # --------------------------------------------------------
-    # Select test samples
+    # Select test flows
     # --------------------------------------------------------
 
-    normal_samples = df[
-        df["Attack Type"] == "Normal Traffic"
-    ].head(2)
+    normal_samples = (
+        df[
+            df["Attack Type"] == "Normal Traffic"
+        ]
+        .head(2)
+    )
 
     attack_samples = (
-        df[df["Attack Type"] != "Normal Traffic"]
+        df[
+            df["Attack Type"] != "Normal Traffic"
+        ]
         .groupby("Attack Type")
         .head(2)
     )
@@ -283,7 +322,7 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------------
-    # Run prediction + decision
+    # Process each flow
     # --------------------------------------------------------
 
     for index, row in test_samples.iterrows():
@@ -297,11 +336,30 @@ if __name__ == "__main__":
             f"{row['Attack Type']}"
         )
 
-        # Run ML prediction pipeline
+        # ----------------------------------------------------
+        # ML prediction
+        # ----------------------------------------------------
+
         prediction = predict_flow(row)
 
-        # Run Decision Engine
-        decision = make_decision(prediction)
+        # ----------------------------------------------------
+        # Decision
+        # ----------------------------------------------------
 
-        # Print final result
-        print_decision(decision)
+        decision = make_decision(
+            prediction
+        )
+
+        print_decision(
+            prediction,
+            decision
+        )
+
+        # ----------------------------------------------------
+        # SHAP explanation
+        # ----------------------------------------------------
+
+        print_shap_explanation(
+            row,
+            prediction
+        )
