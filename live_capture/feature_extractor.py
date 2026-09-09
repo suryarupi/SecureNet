@@ -5,22 +5,28 @@ import pandas as pd
 
 class FlowStats:
     """
-    Collect statistics for one network flow.
+    Collect statistics for one bidirectional network flow.
 
-    A flow is identified externally by:
-        source IP
-        destination IP
-        source port
-        destination port
-        protocol
+    The packet_capture.py file is responsible for identifying
+    the flow and determining packet direction.
+
+    This class extracts the 52 features used by SecureNet.
     """
 
-    def __init__(self, src_port, dst_port):
-        self.src_port = src_port
-        self.dst_port = dst_port
+    def __init__(self, destination_port):
 
-        self.start_time = time.time()
-        self.last_time = self.start_time
+        self.destination_port = int(destination_port)
+
+        # --------------------------------------------------
+        # Flow timing
+        # --------------------------------------------------
+
+        self.start_time = None
+        self.last_time = None
+
+        # --------------------------------------------------
+        # Packet storage
+        # --------------------------------------------------
 
         self.forward_packets = []
         self.backward_packets = []
@@ -28,8 +34,16 @@ class FlowStats:
         self.forward_timestamps = []
         self.backward_timestamps = []
 
-        self.forward_lengths = []
-        self.backward_lengths = []
+        # --------------------------------------------------
+        # Header lengths
+        # --------------------------------------------------
+
+        self.forward_header_lengths = []
+        self.backward_header_lengths = []
+
+        # --------------------------------------------------
+        # TCP
+        # --------------------------------------------------
 
         self.fin_count = 0
         self.psh_count = 0
@@ -38,15 +52,23 @@ class FlowStats:
         self.init_win_forward = 0
         self.init_win_backward = 0
 
-        self.forward_header_lengths = []
-        self.backward_header_lengths = []
+        # --------------------------------------------------
+        # Forward data packets
+        # --------------------------------------------------
+
+        self.forward_data_packets = 0
+        self.forward_segment_sizes = []
+
+        # --------------------------------------------------
+        # Active / Idle periods
+        # --------------------------------------------------
 
         self.active_times = []
         self.idle_times = []
 
-    # --------------------------------------------------
+    # ======================================================
     # Add packet
-    # --------------------------------------------------
+    # ======================================================
 
     def add_packet(
         self,
@@ -60,25 +82,58 @@ class FlowStats:
         ack=False
     ):
 
+        packet_length = int(packet_length)
+        timestamp = float(timestamp)
+        header_length = int(header_length)
+        tcp_window = int(tcp_window)
+
+        # --------------------------------------------------
+        # First packet
+        # --------------------------------------------------
+
+        if self.start_time is None:
+            self.start_time = timestamp
+
+        self.last_time = timestamp
+
+        # --------------------------------------------------
+        # Forward packet
+        # --------------------------------------------------
+
         if direction == "forward":
 
             self.forward_packets.append(packet_length)
             self.forward_timestamps.append(timestamp)
-            self.forward_lengths.append(packet_length)
             self.forward_header_lengths.append(header_length)
 
-            if self.init_win_forward == 0:
+            # Initial TCP window
+            if self.init_win_forward == 0 and tcp_window > 0:
                 self.init_win_forward = tcp_window
+
+            # Data packet
+            payload_length = packet_length - header_length
+
+            if payload_length > 0:
+                self.forward_data_packets += 1
+                self.forward_segment_sizes.append(payload_length)
+
+        # --------------------------------------------------
+        # Backward packet
+        # --------------------------------------------------
 
         else:
 
             self.backward_packets.append(packet_length)
             self.backward_timestamps.append(timestamp)
-            self.backward_lengths.append(packet_length)
             self.backward_header_lengths.append(header_length)
 
-            if self.init_win_backward == 0:
+            # Initial TCP window
+            if self.init_win_backward == 0 and tcp_window > 0:
                 self.init_win_backward = tcp_window
+
+        # --------------------------------------------------
+        # TCP flags
+        # --------------------------------------------------
 
         if fin:
             self.fin_count += 1
@@ -89,36 +144,96 @@ class FlowStats:
         if ack:
             self.ack_count += 1
 
-        self.last_time = timestamp
-
-    # --------------------------------------------------
+    # ======================================================
     # Utility functions
-    # --------------------------------------------------
+    # ======================================================
 
     @staticmethod
     def mean(values):
-      return float(np.mean(values)) if len(values) > 0 else 0.0
 
+        if len(values) == 0:
+            return 0.0
+
+        return float(np.mean(values))
 
     @staticmethod
     def std(values):
-      return float(np.std(values)) if len(values) > 1 else 0.0
 
+        if len(values) <= 1:
+            return 0.0
+
+        return float(np.std(values))
 
     @staticmethod
     def minimum(values):
-      return float(np.min(values)) if len(values) > 0 else 0.0
 
+        if len(values) == 0:
+            return 0.0
+
+        return float(np.min(values))
 
     @staticmethod
     def maximum(values):
-      return float(np.max(values)) if len(values) > 0 else 0.0
 
-    # --------------------------------------------------
+        if len(values) == 0:
+            return 0.0
+
+        return float(np.max(values))
+
+    # ======================================================
+    # Calculate active / idle periods
+    # ======================================================
+
+    @staticmethod
+    def calculate_active_idle(timestamps):
+
+        if len(timestamps) < 2:
+            return [], []
+
+        timestamps = sorted(timestamps)
+
+        active = []
+        idle = []
+
+        current_active = 0.0
+
+        for i in range(1, len(timestamps)):
+
+            gap = (
+                timestamps[i] -
+                timestamps[i - 1]
+            ) * 1_000_000
+
+            # CICIDS/CICFlowMeter-style threshold:
+            # 1 second = 1,000,000 microseconds
+
+            if gap > 1_000_000:
+
+                if current_active > 0:
+                    active.append(current_active)
+
+                idle.append(gap)
+
+                current_active = 0.0
+
+            else:
+
+                current_active += gap
+
+        if current_active > 0:
+            active.append(current_active)
+
+        return active, idle
+
+    # ======================================================
     # Generate 52 ML features
-    # --------------------------------------------------
+    # ======================================================
 
     def to_features(self):
+
+        # --------------------------------------------------
+        # All packets
+        # --------------------------------------------------
 
         all_packets = (
             self.forward_packets +
@@ -138,54 +253,134 @@ class FlowStats:
             total_bwd_bytes
         )
 
-        duration = max(
-            self.last_time - self.start_time,
-            1e-6
-        )
-
-        # ----------------------------------------------
-        # Inter-arrival times
-        # ----------------------------------------------
+        # --------------------------------------------------
+        # Timestamps
+        # --------------------------------------------------
 
         all_timestamps = sorted(
             self.forward_timestamps +
             self.backward_timestamps
         )
 
-        if len(all_timestamps) > 1:
+        # --------------------------------------------------
+        # Flow duration
+        # --------------------------------------------------
 
-            flow_iats = np.diff(all_timestamps)
+        if len(all_timestamps) >= 2:
+
+            duration = (
+                all_timestamps[-1] -
+                all_timestamps[0]
+            ) * 1_000_000
+
+        else:
+
+            duration = 0.0
+
+        # --------------------------------------------------
+        # Flow IAT
+        # --------------------------------------------------
+
+        if len(all_timestamps) >= 2:
+
+            flow_iats = (
+                np.diff(all_timestamps) *
+                1_000_000
+            )
 
         else:
 
             flow_iats = np.array([])
 
-        fwd_iats = (
-            np.diff(self.forward_timestamps)
-            if len(self.forward_timestamps) > 1
-            else np.array([])
+        # --------------------------------------------------
+        # Forward IAT
+        # --------------------------------------------------
+
+        if len(self.forward_timestamps) >= 2:
+
+            fwd_iats = (
+                np.diff(
+                    self.forward_timestamps
+                ) *
+                1_000_000
+            )
+
+        else:
+
+            fwd_iats = np.array([])
+
+        # --------------------------------------------------
+        # Backward IAT
+        # --------------------------------------------------
+
+        if len(self.backward_timestamps) >= 2:
+
+            bwd_iats = (
+                np.diff(
+                    self.backward_timestamps
+                ) *
+                1_000_000
+            )
+
+        else:
+
+            bwd_iats = np.array([])
+
+        # --------------------------------------------------
+        # Active / Idle
+        # --------------------------------------------------
+
+        self.active_times, self.idle_times = (
+            self.calculate_active_idle(
+                all_timestamps
+            )
         )
 
-        bwd_iats = (
-            np.diff(self.backward_timestamps)
-            if len(self.backward_timestamps) > 1
-            else np.array([])
-        )
+        # --------------------------------------------------
+        # Rates
+        # --------------------------------------------------
 
-        # ----------------------------------------------
-        # Packet statistics
-        # ----------------------------------------------
+        if duration > 0:
 
-        packet_lengths = all_packets
+            duration_seconds = (
+                duration / 1_000_000
+            )
 
-        # ----------------------------------------------
-        # Features
-        # ----------------------------------------------
+            flow_bytes_per_sec = (
+                total_bytes /
+                duration_seconds
+            )
+
+            flow_packets_per_sec = (
+                total_packets /
+                duration_seconds
+            )
+
+            fwd_packets_per_sec = (
+                total_fwd /
+                duration_seconds
+            )
+
+            bwd_packets_per_sec = (
+                total_bwd /
+                duration_seconds
+            )
+
+        else:
+
+            flow_bytes_per_sec = 0.0
+            flow_packets_per_sec = 0.0
+            fwd_packets_per_sec = 0.0
+            bwd_packets_per_sec = 0.0
+
+        # --------------------------------------------------
+        # 52 FEATURES
+        # --------------------------------------------------
 
         features = {
 
             "Destination Port":
-                self.dst_port,
+                self.destination_port,
 
             "Flow Duration":
                 duration,
@@ -197,34 +392,50 @@ class FlowStats:
                 total_fwd_bytes,
 
             "Fwd Packet Length Max":
-                self.maximum(self.forward_packets),
+                self.maximum(
+                    self.forward_packets
+                ),
 
             "Fwd Packet Length Min":
-                self.minimum(self.forward_packets),
+                self.minimum(
+                    self.forward_packets
+                ),
 
             "Fwd Packet Length Mean":
-                self.mean(self.forward_packets),
+                self.mean(
+                    self.forward_packets
+                ),
 
             "Fwd Packet Length Std":
-                self.std(self.forward_packets),
+                self.std(
+                    self.forward_packets
+                ),
 
             "Bwd Packet Length Max":
-                self.maximum(self.backward_packets),
+                self.maximum(
+                    self.backward_packets
+                ),
 
             "Bwd Packet Length Min":
-                self.minimum(self.backward_packets),
+                self.minimum(
+                    self.backward_packets
+                ),
 
             "Bwd Packet Length Mean":
-                self.mean(self.backward_packets),
+                self.mean(
+                    self.backward_packets
+                ),
 
             "Bwd Packet Length Std":
-                self.std(self.backward_packets),
+                self.std(
+                    self.backward_packets
+                ),
 
             "Flow Bytes/s":
-                total_bytes / duration,
+                flow_bytes_per_sec,
 
             "Flow Packets/s":
-                total_packets / duration,
+                flow_packets_per_sec,
 
             "Flow IAT Mean":
                 self.mean(flow_iats),
@@ -240,7 +451,7 @@ class FlowStats:
 
             "Fwd IAT Total":
                 float(np.sum(fwd_iats))
-                if len(fwd_iats)
+                if len(fwd_iats) > 0
                 else 0.0,
 
             "Fwd IAT Mean":
@@ -257,7 +468,7 @@ class FlowStats:
 
             "Bwd IAT Total":
                 float(np.sum(bwd_iats))
-                if len(bwd_iats)
+                if len(bwd_iats) > 0
                 else 0.0,
 
             "Bwd IAT Mean":
@@ -273,32 +484,44 @@ class FlowStats:
                 self.minimum(bwd_iats),
 
             "Fwd Header Length":
-                sum(self.forward_header_lengths),
+                sum(
+                    self.forward_header_lengths
+                ),
 
             "Bwd Header Length":
-                sum(self.backward_header_lengths),
+                sum(
+                    self.backward_header_lengths
+                ),
 
             "Fwd Packets/s":
-                total_fwd / duration,
+                fwd_packets_per_sec,
 
             "Bwd Packets/s":
-                total_bwd / duration,
+                bwd_packets_per_sec,
 
             "Min Packet Length":
-                self.minimum(packet_lengths),
+                self.minimum(
+                    all_packets
+                ),
 
             "Max Packet Length":
-                self.maximum(packet_lengths),
+                self.maximum(
+                    all_packets
+                ),
 
             "Packet Length Mean":
-                self.mean(packet_lengths),
+                self.mean(
+                    all_packets
+                ),
 
             "Packet Length Std":
-                self.std(packet_lengths),
+                self.std(
+                    all_packets
+                ),
 
             "Packet Length Variance":
-                float(np.var(packet_lengths))
-                if packet_lengths
+                float(np.var(all_packets))
+                if len(all_packets) > 0
                 else 0.0,
 
             "FIN Flag Count":
@@ -311,8 +534,11 @@ class FlowStats:
                 self.ack_count,
 
             "Average Packet Size":
-                total_bytes / total_packets
-                if total_packets
+                (
+                    total_bytes /
+                    total_packets
+                )
+                if total_packets > 0
                 else 0.0,
 
             "Subflow Fwd Bytes":
@@ -325,28 +551,53 @@ class FlowStats:
                 self.init_win_backward,
 
             "act_data_pkt_fwd":
-                total_fwd,
+                self.forward_data_packets,
 
             "min_seg_size_forward":
-                0,
+                self.minimum(
+                    self.forward_segment_sizes
+                ),
 
             "Active Mean":
-                self.mean(self.active_times),
+                self.mean(
+                    self.active_times
+                ),
 
             "Active Max":
-                self.maximum(self.active_times),
+                self.maximum(
+                    self.active_times
+                ),
 
             "Active Min":
-                self.minimum(self.active_times),
+                self.minimum(
+                    self.active_times
+                ),
 
             "Idle Mean":
-                self.mean(self.idle_times),
+                self.mean(
+                    self.idle_times
+                ),
 
             "Idle Max":
-                self.maximum(self.idle_times),
+                self.maximum(
+                    self.idle_times
+                ),
 
             "Idle Min":
-                self.minimum(self.idle_times),
+                self.minimum(
+                    self.idle_times
+                ),
         }
+
+        # --------------------------------------------------
+        # Safety check
+        # --------------------------------------------------
+
+        if len(features) != 52:
+
+            raise ValueError(
+                f"Expected 52 features, "
+                f"but generated {len(features)}"
+            )
 
         return pd.DataFrame([features])

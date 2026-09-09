@@ -30,28 +30,32 @@ def make_decision(prediction):
     # NORMAL
     # --------------------------------------------------------
 
-    if prediction["binary_prediction"] == "Normal" and anomaly:
-
-        return {
-        "status": "SUSPICIOUS",
-        "severity": "LOW",
-        "attack_type": None,
-        "reason": (
-            "XGBoost classified the traffic as normal, "
-            "but Isolation Forest detected anomalous "
-            "network behaviour."
-        )
-    }
-
+# --------------------------------------------------------
+# NORMAL / ANOMALY CHECK
+# --------------------------------------------------------
+ 
     if prediction["binary_prediction"] == "Normal":
 
+     if anomaly:
+
         return {
+            "status": "SUSPICIOUS",
+            "severity": "LOW",
+            "attack_type": None,
+            "reason": (
+                "Binary XGBoost classified the traffic as normal, "
+                "but Isolation Forest detected anomalous "
+                "network behaviour."
+            )
+        }
+
+     return {
         "status": "NORMAL",
         "severity": "NONE",
         "attack_type": None,
         "reason": (
-            "No significant attack probability or "
-            "anomaly was detected."
+            "Binary XGBoost classified the traffic as normal "
+            "and no significant anomaly was detected."
         )
     }
 

@@ -9,14 +9,30 @@ import time
 
 sys.path.append(
     os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..")
+        os.path.join(
+            os.path.dirname(__file__),
+            ".."
+        )
     )
 )
 
 from prediction.predict import predict_flow
-from prediction.decision_engine import make_decision, print_decision
+from prediction.decision_engine import (
+    make_decision,
+    print_decision
+)
 
-from scapy.all import sniff, IP, TCP, UDP
+# ------------------------------------------------------------
+# NEW: live data store (SQLite bridge to the dashboard)
+# ------------------------------------------------------------
+from dashboard.live_data import LiveDataStore
+
+from scapy.all import (
+    sniff,
+    IP,
+    TCP,
+    UDP
+)
 
 from feature_extractor import FlowStats
 
@@ -27,14 +43,20 @@ from feature_extractor import FlowStats
 
 INTERFACE = "wlp0s20f3"
 
-# Keep active flows in memory
-flows = {}
-
-# Remove inactive flows after this many seconds
 FLOW_TIMEOUT = 15
 
-# Used for graceful shutdown
+# Minimum number of packets required before
+# sending a flow to the ML models.
+MIN_PACKETS = 2
+
 STOP_CAPTURE = False
+
+flows = {}
+
+# ------------------------------------------------------------
+# NEW: single long-lived store used for the whole capture run
+# ------------------------------------------------------------
+store = LiveDataStore()
 
 
 # ============================================================
@@ -42,51 +64,182 @@ STOP_CAPTURE = False
 # ============================================================
 
 WELL_KNOWN_PORTS = {
-    20,      # FTP Data
-    21,      # FTP
-    22,      # SSH
-    23,      # Telnet
-    25,      # SMTP
-    53,      # DNS
-    67, 68,  # DHCP
-    80,      # HTTP
-    110,     # POP3
-    123,     # NTP
-    143,     # IMAP
-    161,     # SNMP
-    389,     # LDAP
-    443,     # HTTPS
-    445,     # SMB
-    587,     # SMTP
-    636,     # LDAPS
-    993,     # IMAPS
-    995,     # POP3S
-    1433,    # MSSQL
-    3306,    # MySQL
-    3389,    # RDP
-    5432,    # PostgreSQL
-    8080,    # HTTP Alt
-    8443     # HTTPS Alt
+    20, 21, 22, 23, 25,
+    53,
+    67, 68,
+    80,
+    110,
+    123,
+    143,
+    161,
+    389,
+    443,
+    445,
+    587,
+    636,
+    993,
+    995,
+    1433,
+    3306,
+    3389,
+    5432,
+    5222,
+    8080,
+    8443
 }
 
 
 # ============================================================
-# Flow identification
+# Get packet transport information
+# ============================================================
+
+def get_transport_info(packet):
+
+    if TCP in packet:
+
+        return (
+            "TCP",
+            int(packet[TCP].sport),
+            int(packet[TCP].dport)
+        )
+
+    if UDP in packet:
+
+        return (
+            "UDP",
+            int(packet[UDP].sport),
+            int(packet[UDP].dport)
+        )
+
+    return None
+
+
+# ============================================================
+# Create bidirectional flow key
 # ============================================================
 
 def get_flow_key(packet):
-    """
-    Create a bidirectional flow key.
-
-    Packets travelling in either direction belong
-    to the same flow.
-    """
 
     if IP not in packet:
         return None
 
-    src_ip = packet[IP].src
-    dst_ip = packet[IP].dst
+    transport = get_transport_info(packet)
+
+    if transport is None:
+        return None
+
+    protocol, src_port, dst_port = transport
+
+    src_endpoint = (
+        packet[IP].src,
+        src_port
+    )
+
+    dst_endpoint = (
+        packet[IP].dst,
+        dst_port
+    )
+
+    # --------------------------------------------------------
+    # Sort endpoints so both directions belong to
+    # exactly the same flow.
+    # --------------------------------------------------------
+
+    if src_endpoint <= dst_endpoint:
+
+        first = src_endpoint
+        second = dst_endpoint
+
+    else:
+
+        first = dst_endpoint
+        second = src_endpoint
+
+    return (
+        protocol,
+        first,
+        second
+    )
+
+
+# ============================================================
+# Determine direction
+# ============================================================
+
+def get_direction(packet, flow_key):
+
+    _, endpoint1, endpoint2 = flow_key
+
+    transport = get_transport_info(packet)
+
+    if transport is None:
+        return None
+
+    _, src_port, _ = transport
+
+    src_endpoint = (
+        packet[IP].src,
+        src_port
+    )
+
+    if src_endpoint == endpoint1:
+
+        return "forward"
+
+    if src_endpoint == endpoint2:
+
+        return "backward"
+
+    return None
+
+
+# ============================================================
+# Determine service / destination port
+# ============================================================
+
+def get_service_port(src_port, dst_port):
+
+    # --------------------------------------------------------
+    # If destination is a well-known service port,
+    # it is the service port.
+    # --------------------------------------------------------
+
+    if dst_port in WELL_KNOWN_PORTS:
+
+        return dst_port
+
+    # --------------------------------------------------------
+    # If source is a well-known service port,
+    # this packet is probably travelling from server
+    # to client.
+    # --------------------------------------------------------
+
+    if src_port in WELL_KNOWN_PORTS:
+
+        return src_port
+
+    # --------------------------------------------------------
+    # Otherwise use destination port.
+    # --------------------------------------------------------
+
+    return dst_port
+
+
+# ============================================================
+# Extract packet metadata
+# ============================================================
+
+def extract_packet_metadata(packet):
+
+    packet_length = len(packet)
+
+    header_length = 0
+    tcp_window = 0
+
+    fin = False
+    psh = False
+    ack = False
+    rst = False
 
     # --------------------------------------------------------
     # TCP
@@ -94,9 +247,39 @@ def get_flow_key(packet):
 
     if TCP in packet:
 
-        protocol = "TCP"
-        src_port = packet[TCP].sport
-        dst_port = packet[TCP].dport
+        tcp = packet[TCP]
+
+        # TCP header length
+        if tcp.dataofs is not None:
+
+            header_length = int(
+                tcp.dataofs
+            ) * 4
+
+        # TCP receive window
+        tcp_window = int(
+            tcp.window
+        )
+
+        flags = int(
+            tcp.flags
+        )
+
+        fin = bool(
+            flags & 0x01
+        )
+
+        rst = bool(
+            flags & 0x04
+        )
+
+        psh = bool(
+            flags & 0x08
+        )
+
+        ack = bool(
+            flags & 0x10
+        )
 
     # --------------------------------------------------------
     # UDP
@@ -104,249 +287,267 @@ def get_flow_key(packet):
 
     elif UDP in packet:
 
-        protocol = "UDP"
-        src_port = packet[UDP].sport
-        dst_port = packet[UDP].dport
+        # UDP header = 8 bytes
+        header_length = 8
 
-    else:
-        return None
-
-    endpoint1 = (src_ip, src_port)
-    endpoint2 = (dst_ip, dst_port)
-
-    # --------------------------------------------------------
-    # Sort endpoints so both directions use the same key
-    # --------------------------------------------------------
-
-    if endpoint1 <= endpoint2:
-
-        return (
-            protocol,
-            endpoint1,
-            endpoint2
-        )
-
-    else:
-
-        return (
-            protocol,
-            endpoint2,
-            endpoint1
-        )
+    return {
+        "packet_length": packet_length,
+        "header_length": header_length,
+        "tcp_window": tcp_window,
+        "fin": fin,
+        "psh": psh,
+        "ack": ack,
+        "rst": rst
+    }
 
 
 # ============================================================
-# Packet processing
+# Process packet
 # ============================================================
 
 def process_packet(packet):
 
-    # Ignore packets without IP
+    # --------------------------------------------------------
+    # Only process IPv4 packets
+    # --------------------------------------------------------
+
     if IP not in packet:
         return
+
+    transport = get_transport_info(packet)
+
+    if transport is None:
+        return
+
+    protocol, src_port, dst_port = transport
+
+    # --------------------------------------------------------
+    # Flow key
+    # --------------------------------------------------------
 
     flow_key = get_flow_key(packet)
 
     if flow_key is None:
         return
 
-    protocol, endpoint1, endpoint2 = flow_key
-
-    src_ip = packet[IP].src
-    dst_ip = packet[IP].dst
-
     # --------------------------------------------------------
-    # Get source and destination ports
+    # Direction
     # --------------------------------------------------------
 
-    if TCP in packet:
+    direction = get_direction(
+        packet,
+        flow_key
+    )
 
-        src_port = packet[TCP].sport
-        dst_port = packet[TCP].dport
-
-    elif UDP in packet:
-
-        src_port = packet[UDP].sport
-        dst_port = packet[UDP].dport
-
-    else:
-
+    if direction is None:
         return
 
     # --------------------------------------------------------
-    # Determine packet direction
+    # Timestamp
     # --------------------------------------------------------
 
-    if (
-        src_ip == endpoint1[0]
-        and src_port == endpoint1[1]
-    ):
-
-        direction = "forward"
-
-    else:
-
-        direction = "backward"
+    timestamp = float(
+        packet.time
+    )
 
     # --------------------------------------------------------
-    # Packet information
-    # --------------------------------------------------------
-
-    timestamp = float(packet.time)
-
-    packet_length = len(packet)
-
-    # ========================================================
     # Create new flow
-    # ========================================================
+    # --------------------------------------------------------
 
     if flow_key not in flows:
 
-        # ----------------------------------------------------
-        # Determine service / destination port
-        # ----------------------------------------------------
-
-        if src_port in WELL_KNOWN_PORTS:
-
-            destination_port = src_port
-
-        elif dst_port in WELL_KNOWN_PORTS:
-
-            destination_port = dst_port
-
-        else:
-
-            destination_port = dst_port
-
-        # ----------------------------------------------------
-        # Create flow
-        # ----------------------------------------------------
+        service_port = get_service_port(
+            src_port,
+            dst_port
+        )
 
         flows[flow_key] = {
 
             "stats": FlowStats(
-                destination_port,
-                destination_port
+                service_port
             ),
 
             "last_seen": timestamp,
 
-            # TCP termination state
+            "packet_count": 0,
+
             "rst": False,
+
             "fin_forward": False,
-            "fin_backward": False
+
+            "fin_backward": False,
+
+            "protocol": protocol,
+
+            # ------------------------------------------------
+            # NEW: remember the originating endpoints so the
+            # dashboard can display readable src/dst columns.
+            # This does NOT affect ML features - FlowStats
+            # already tracks direction independently via
+            # get_direction() above.
+            # ------------------------------------------------
+            "src_ip": packet[IP].src,
+            "src_port": src_port,
+            "dst_ip": packet[IP].dst,
+            "dst_port": dst_port
         }
 
         print(
             f"\n[+] New flow: "
-            f"{src_ip}:{src_port} -> "
-            f"{dst_ip}:{dst_port}"
+            f"{packet[IP].src}:{src_port} -> "
+            f"{packet[IP].dst}:{dst_port}"
         )
 
         print(
-            f"    Service Port: {destination_port}"
+            f"    Protocol    : {protocol}"
         )
 
-    # ========================================================
+        print(
+            f"    Service Port: {service_port}"
+        )
+
+    # --------------------------------------------------------
     # Get flow
-    # ========================================================
+    # --------------------------------------------------------
 
     flow = flows[flow_key]
+
+    # --------------------------------------------------------
+    # Extract packet metadata
+    # --------------------------------------------------------
+
+    metadata = extract_packet_metadata(
+        packet
+    )
 
     # --------------------------------------------------------
     # Add packet statistics
     # --------------------------------------------------------
 
     flow["stats"].add_packet(
-        packet_length,
-        timestamp,
-        direction,
-        packet_length
+
+        packet_length=metadata[
+            "packet_length"
+        ],
+
+        timestamp=timestamp,
+
+        direction=direction,
+
+        header_length=metadata[
+            "header_length"
+        ],
+
+        tcp_window=metadata[
+            "tcp_window"
+        ],
+
+        fin=metadata[
+            "fin"
+        ],
+
+        psh=metadata[
+            "psh"
+        ],
+
+        ack=metadata[
+            "ack"
+        ]
     )
+
+    # --------------------------------------------------------
+    # Update flow state
+    # --------------------------------------------------------
 
     flow["last_seen"] = timestamp
 
-    # ========================================================
-    # TCP flags
-    # ========================================================
+    flow["packet_count"] += 1
 
-    if TCP in packet:
+    # --------------------------------------------------------
+    # TCP RST
+    # --------------------------------------------------------
 
-        flags = packet[TCP].flags
+    if metadata["rst"]:
 
-        # ----------------------------------------------------
-        # RST flag
-        # TCP RST = 0x04
-        # ----------------------------------------------------
+        flow["rst"] = True
 
-        if flags & 0x04:
+    # --------------------------------------------------------
+    # TCP FIN
+    # --------------------------------------------------------
 
-            flow["rst"] = True
+    if metadata["fin"]:
 
-        # ----------------------------------------------------
-        # FIN flag
-        # TCP FIN = 0x01
-        # ----------------------------------------------------
+        if direction == "forward":
 
-        if flags & 0x01:
+            flow["fin_forward"] = True
 
-            if direction == "forward":
+        else:
 
-                flow["fin_forward"] = True
-
-            else:
-
-                flow["fin_backward"] = True
-
-        # ----------------------------------------------------
-        # Update FlowStats counters
-        # ----------------------------------------------------
-
-        if hasattr(
-            flow["stats"],
-            "fin_flag_count"
-        ):
-
-            if flags & 0x01:
-
-                flow["stats"].fin_flag_count += 1
-
-        if hasattr(
-            flow["stats"],
-            "psh_flag_count"
-        ):
-
-            if flags & 0x08:
-
-                flow["stats"].psh_flag_count += 1
-
-        if hasattr(
-            flow["stats"],
-            "ack_flag_count"
-        ):
-
-            if flags & 0x10:
-
-                flow["stats"].ack_flag_count += 1
+            flow["fin_backward"] = True
 
 
 # ============================================================
 # Process completed flow
 # ============================================================
 
-def process_completed_flow(key, reason):
+def process_completed_flow(
+    key,
+    reason
+):
 
-    flow = flows.pop(key, None)
+    flow = flows.pop(
+        key,
+        None
+    )
 
     if flow is None:
         return
 
+    packet_count = flow[
+        "packet_count"
+    ]
+
+    # --------------------------------------------------------
+    # Ignore extremely small flows
+    # --------------------------------------------------------
+
+    if packet_count < MIN_PACKETS:
+
+        print(
+            f"\n[FLOW IGNORED - {reason}]"
+        )
+
+        print(
+            f"    Packets: {packet_count}"
+        )
+
+        print(
+            "    Reason: "
+            "Insufficient packets for flow classification."
+        )
+
+        return
+
     try:
 
-        features = flow["stats"].to_features()
+        # ----------------------------------------------------
+        # Extract features
+        # ----------------------------------------------------
+
+        features = flow[
+            "stats"
+        ].to_features()
 
         print(
             f"\n[FLOW COMPLETED - {reason}]"
+        )
+
+        print(
+            "\n--- LIVE FEATURES ---"
+        )
+
+        print(
+            features.T.to_string()
         )
 
         print(
@@ -358,13 +559,17 @@ def process_completed_flow(key, reason):
         # ML prediction
         # ----------------------------------------------------
 
-        prediction = predict_flow(features)
+        prediction = predict_flow(
+            features
+        )
 
         # ----------------------------------------------------
         # Decision engine
         # ----------------------------------------------------
 
-        decision = make_decision(prediction)
+        decision = make_decision(
+            prediction
+        )
 
         # ----------------------------------------------------
         # Display decision
@@ -375,17 +580,58 @@ def process_completed_flow(key, reason):
             decision
         )
 
+        # ----------------------------------------------------
+        # NEW: persist the result for the dashboard.
+        # Wrapped in its own try/except so a storage problem
+        # can never take down the live pipeline above.
+        # ----------------------------------------------------
+
+        try:
+
+            row = {
+                "timestamp": time.time(),
+                "src_ip": flow.get("src_ip"),
+                "src_port": flow.get("src_port"),
+                "dst_ip": flow.get("dst_ip"),
+                "dst_port": flow.get("dst_port"),
+                "protocol": flow.get("protocol"),
+                "status": decision["status"],
+                "severity": decision["severity"],
+                "attack_type": decision["attack_type"],
+                "attack_probability": prediction["attack_probability"],
+                "attack_confidence": prediction["attack_confidence"],
+                "anomaly": prediction["anomaly"],
+                "anomaly_score": prediction["anomaly_score"],
+                "reason": decision["reason"],
+            }
+
+            try:
+                features_dict = features.iloc[0].to_dict()
+            except Exception:
+                features_dict = None
+
+            store.insert_flow(row, features=features_dict)
+
+        except Exception as store_error:
+
+            print(
+                "\n[!] Error storing flow for dashboard "
+                f"(pipeline unaffected): {store_error}"
+            )
+
     except Exception as e:
 
         print(
             "\n[!] Error processing flow:"
         )
 
-        print(e)
+        print(
+            f"    {type(e).__name__}: {e}"
+        )
 
 
 # ============================================================
-# Remove completed / inactive flows
+# Cleanup inactive / completed flows
 # ============================================================
 
 def cleanup_flows():
@@ -395,10 +641,12 @@ def cleanup_flows():
     expired = []
 
     # --------------------------------------------------------
-    # Check all active flows
+    # Examine active flows
     # --------------------------------------------------------
 
-    for key, flow in list(flows.items()):
+    for key, flow in list(
+        flows.items()
+    ):
 
         rst = flow.get(
             "rst",
@@ -415,8 +663,13 @@ def cleanup_flows():
             False
         )
 
+        last_seen = flow.get(
+            "last_seen",
+            current_time
+        )
+
         # ----------------------------------------------------
-        # TCP RST
+        # RST
         # ----------------------------------------------------
 
         if rst:
@@ -426,7 +679,7 @@ def cleanup_flows():
             )
 
         # ----------------------------------------------------
-        # Both directions sent FIN
+        # Both sides FIN
         # ----------------------------------------------------
 
         elif (
@@ -439,12 +692,12 @@ def cleanup_flows():
             )
 
         # ----------------------------------------------------
-        # Inactive flow
+        # Timeout
         # ----------------------------------------------------
 
         elif (
-            current_time
-            - flow["last_seen"]
+            current_time -
+            last_seen
             > FLOW_TIMEOUT
         ):
 
@@ -468,7 +721,10 @@ def cleanup_flows():
 # Signal handler
 # ============================================================
 
-def stop_capture(signum, frame):
+def stop_capture(
+    signum,
+    frame
+):
 
     global STOP_CAPTURE
 
@@ -492,20 +748,28 @@ def stop_capture(signum, frame):
 
 if __name__ == "__main__":
 
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
 
     print(
         "       SecureNet Live Packet Capture"
     )
 
-    print("=" * 60)
-
     print(
-        f"Interface    : {INTERFACE}"
+        "=" * 60
     )
 
     print(
-        f"Flow timeout : {FLOW_TIMEOUT} seconds"
+        f"Interface       : {INTERFACE}"
+    )
+
+    print(
+        f"Flow timeout    : {FLOW_TIMEOUT} seconds"
+    )
+
+    print(
+        f"Minimum packets : {MIN_PACKETS}"
     )
 
     print(
@@ -517,7 +781,7 @@ if __name__ == "__main__":
     )
 
     # --------------------------------------------------------
-    # Register signal handlers
+    # Signal handlers
     # --------------------------------------------------------
 
     signal.signal(
@@ -531,7 +795,7 @@ if __name__ == "__main__":
     )
 
     # ========================================================
-    # Capture packets
+    # Capture loop
     # ========================================================
 
     try:
@@ -539,14 +803,6 @@ if __name__ == "__main__":
         while not STOP_CAPTURE:
 
             try:
-
-                # Capture packets for 2 seconds.
-                #
-                # The short timeout allows us to:
-                #   1. Check flow timeouts
-                #   2. Respond to Ctrl+C
-                #   3. Keep the capture responsive
-                #
 
                 sniff(
                     iface=INTERFACE,
@@ -558,25 +814,29 @@ if __name__ == "__main__":
             except Exception as e:
 
                 print(
-                    f"\n[!] Packet capture error: {e}"
+                    f"\n[!] Packet capture error: "
+                    f"{e}"
                 )
-
-                # Don't immediately crash SecureNet.
-                # Give Scapy a moment before retrying.
 
                 if not STOP_CAPTURE:
 
                     time.sleep(1)
 
             # ------------------------------------------------
-            # Check completed / inactive flows
+            # Check flow completion
             # ------------------------------------------------
 
             cleanup_flows()
 
+            # ------------------------------------------------
+            # NEW: heartbeat so the dashboard knows capture
+            # is alive, even during quiet traffic periods.
+            # ------------------------------------------------
+
+            store.heartbeat(INTERFACE)
+
     except KeyboardInterrupt:
 
-        # This is a fallback in case Ctrl+C reaches here
         STOP_CAPTURE = True
 
     finally:
@@ -584,10 +844,6 @@ if __name__ == "__main__":
         print(
             "\n[!] Final cleanup..."
         )
-
-        # ====================================================
-        # Process remaining flows
-        # ====================================================
 
         remaining_flows = list(
             flows.keys()
@@ -608,11 +864,12 @@ if __name__ == "__main__":
                     "CAPTURE STOPPED"
                 )
 
-        # ----------------------------------------------------
-        # Clear flow table
-        # ----------------------------------------------------
-
         flows.clear()
+
+        # ------------------------------------------------
+        # NEW: close the DB connection cleanly.
+        # ------------------------------------------------
+        store.close()
 
         print(
             "\n[+] SecureNet capture stopped."
