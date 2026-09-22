@@ -360,3 +360,40 @@ def fetch_flow_features(flow_id):
     except Exception as e:
         print(f"[!] Failed to fetch flow features: {e}")
         return None
+
+
+def clear_all_flows(keep_heartbeat=True):
+    """
+    Deletes all rows from `flows` and `flow_features` so the dashboard
+    starts fresh. Safe to call at any time - if the capture process is
+    running concurrently and inserts a new flow right after this runs,
+    that new flow is unaffected (it just becomes the new first row).
+
+    keep_heartbeat: if True (default), the LIVE/OFFLINE status is left
+        alone - clearing history shouldn't make a running capture
+        process look offline. Set False to also reset heartbeat.
+
+    Returns True on success, False on failure (never raises).
+    """
+
+    try:
+        conn = get_connection()
+        init_db(conn)
+
+        conn.execute("DELETE FROM flow_features")
+        conn.execute("DELETE FROM flows")
+
+        if not keep_heartbeat:
+            conn.execute("DELETE FROM heartbeat")
+
+        # Reclaim the autoincrement counter so new flow ids start
+        # back at 1 (purely cosmetic, but nicer for a fresh demo run).
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'flows'")
+
+        conn.commit()
+        conn.close()
+        return True
+
+    except Exception as e:
+        print(f"[!] Failed to clear flow history: {e}")
+        return False

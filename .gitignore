@@ -29,3 +29,6 @@ data/
 
 # macOS
 .DS_Store
+
+#graphs
+graphs/
